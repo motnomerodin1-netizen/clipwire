@@ -1,0 +1,125 @@
+name: Build clipwire (Ubuntu + full SDK v6 paced race)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld git python3
+
+      - name: Fetch full iPhoneOS 26.1 SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/xybp888/iOS-SDKs.git sdks
+          cd sdks
+          git sparse-checkout set iPhoneOS26.1.sdk
+          git checkout
+
+      - name: Create header shims
+        run: |
+          mkdir -p shim/mach shim/IOSurface
+          cat > shim/mach/mach_vm.h <<'EOF'
+          #ifndef MACH_MACH_VM_SHIM_H
+          #define MACH_MACH_VM_SHIM_H
+          #include <mach/mach.h>
+          #include <mach/vm_map.h>
+          #include <mach/vm_region.h>
+          #include <stdint.h>
+
+          typedef uint64_t mach_vm_address_t;
+          typedef uint64_t mach_vm_size_t;
+          typedef uint64_t mach_vm_offset_t;
+
+          typedef vm_region_basic_info_data_64_t vm_region_basic_info_data_64;
+
+          kern_return_t mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
+          kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size);
+          kern_return_t mach_vm_region(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t *size, int flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object);
+          kern_return_t mach_vm_page_info(vm_map_t target, mach_vm_address_t address, int flavor, unsigned int *info, mach_msg_type_number_t *infoCnt);
+          kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size, mach_vm_offset_t mask, int flags, mach_port_t object, mach_vm_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance);
+          #endif
+          EOF
+          cat > shim/IOSurface/IOSurface.h <<'EOF'
+          #ifndef IOSURFACE_SHIM_H
+          #define IOSURFACE_SHIM_H
+          #include <IOSurface/IOSurfaceBase.h>
+          #include <IOSurface/IOSurfaceRef.h>
+          #endif
+          EOF
+
+      - name: Patch file logging into main.m
+        run: |
+          python3 - <<'PY'
+          p = 'src/main.m'
+          s = open(p, encoding='utf-8').read()
+          old = 'int main(int argc, char *argv[])\n{\n    @autoreleasepool {\n'
+          new = '''int main(int argc, char *argv[])
+          {
+              char cw_log[1024];
+              const char *cw_home = getenv("HOME");
+              if (cw_home) {
+                  snprintf(cw_log, sizeof(cw_log), "%s/Documents/clipwire.log", cw_home);
+                  FILE *cw_f = fopen(cw_log, "w");
+                  if (cw_f) { dup2(fileno(cw_f), 1); dup2(fileno(cw_f), 2); setvbuf(cw_f, NULL, _IOLBF, 0); }
+              }
+              @autoreleasepool {
+          '''
+          if old not in s:
+              raise SystemExit('main.m pattern not found')
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+          print('patched main.m')
+          PY
+
+      - name: Pace the race to avoid watchdog
+        run: |
+          python3 - <<'PY'
+          p = 'src/trigger.c'
+          s = open(p, encoding='utf-8').read()
+          old = '            g_in_fault = 0;\n        }\n        g_fault_rounds++;'
+          new = '            g_in_fault = 0;\n            nsleep(2000);\n        }\n        g_fault_rounds++;'
+          if old not in s:
+              raise SystemExit('trigger.c pattern not found')
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+          print('paced fault_thread')
+
+          p = 'src/clipwire.h'
+          s = open(p, encoding='utf-8').read()
+          for a, b in [
+              ('#define RACE_ITERATIONS    2000', '#define RACE_ITERATIONS    400'),
+              ('#define RACE_ATTEMPTS      20', '#define RACE_ATTEMPTS      4'),
+              ('#define FREELIST_CHURN_MAPS 512', '#define FREELIST_CHURN_MAPS 128'),
+          ]:
+              if a not in s:
+                  raise SystemExit('clipwire.h pattern not found: ' + a)
+              s = s.replace(a, b, 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('reduced race constants')
+          PY
+
+      - name: Build arm64 binary
+        run: |
+          clang -target arm64-apple-ios15.0 \
+            -I"$GITHUB_WORKSPACE/shim" \
+            -isysroot "$GITHUB_WORKSPACE/sdks/iPhoneOS26.1.sdk" \
+            -fuse-ld=lld -fobjc-arc -O2 -Wall \
+            -Wno-deprecated-declarations -Wno-macro-redefined \
+            -Wno-incompatible-pointer-types \
+            src/main.m src/util.c src/slide.c src/trigger.c src/wire.c \
+            src/exploit.c src/krw.c \
+            -framework IOSurface -framework Foundation \
+            -o clipwire
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipwire
+          path: clipwire
