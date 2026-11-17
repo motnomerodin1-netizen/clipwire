@@ -1,0 +1,41 @@
+name: Build clipwire (Ubuntu cross-compile)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld git python3
+
+      - name: Fetch iPhoneOS SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/theos/sdks.git sdks
+          cd sdks
+          git sparse-checkout set iPhoneOS16.5.sdk
+          git checkout
+
+      - name: Build arm64e binary
+        run: |
+          clang -target arm64e-apple-ios15.0 \
+            -isysroot "$GITHUB_WORKSPACE/sdks/iPhoneOS16.5.sdk" \
+            -fuse-ld=lld -fobjc-arc -O2 -Wall -Wno-deprecated-declarations \
+            src/main.m src/util.c src/slide.c src/trigger.c src/wire.c \
+            src/exploit.c src/krw.c \
+            -framework IOSurface -framework Foundation \
+            -o clipwire
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipwire
+          path: clipwire
