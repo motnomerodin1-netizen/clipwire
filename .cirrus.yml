@@ -1,0 +1,12 @@
+task:
+  name: Build clipwire for iOS 26.1 (A13)
+  macos_instance:
+    image: ghcr.io/cirruslabs/macos-runner:sequoia
+  install_script:
+    - brew install ldid
+  build_script:
+    - make
+    - ldid -Sentitlements.plist clipwire
+  always:
+    artifacts:
+      - path: clipwire
