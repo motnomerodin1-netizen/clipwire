@@ -1,0 +1,92 @@
+name: Build clipwire (Ubuntu + full SDK)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld git python3
+
+      - name: Fetch full iPhoneOS 26.1 SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/xybp888/iOS-SDKs.git sdks
+          cd sdks
+          git sparse-checkout set iPhoneOS26.1.sdk
+          git checkout
+
+      - name: Create header shims
+        run: |
+          mkdir -p shim/mach shim/IOSurface
+          cat > shim/mach/mach_vm.h <<'EOF'
+          #ifndef MACH_MACH_VM_SHIM_H
+          #define MACH_MACH_VM_SHIM_H
+          #include <mach/mach.h>
+          #include <mach/vm_map.h>
+          #include <mach/vm_region.h>
+          #include <stdint.h>
+
+          typedef uint64_t mach_vm_address_t;
+          typedef uint64_t mach_vm_size_t;
+          typedef uint64_t mach_vm_offset_t;
+
+          #ifndef VM_REGION_BASIC_INFO_64
+          #define VM_REGION_BASIC_INFO_64 11
+          #endif
+          typedef struct vm_region_basic_info_64 {
+              int protection;
+              int max_protection;
+              unsigned int inheritance;
+              boolean_t shared;
+              boolean_t reserved;
+              unsigned short offset;
+              vm_behavior_t behavior;
+              unsigned short user_wire_count;
+              int wired_count;
+              unsigned int object_id;
+          } vm_region_basic_info_data_64_t;
+          typedef vm_region_basic_info_data_64_t vm_region_basic_info_data_64;
+          #ifndef VM_REGION_BASIC_INFO_COUNT_64
+          #define VM_REGION_BASIC_INFO_COUNT_64 ((mach_msg_type_number_t)(sizeof(vm_region_basic_info_data_64_t)/sizeof(int)))
+          #endif
+
+          kern_return_t mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
+          kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size);
+          kern_return_t mach_vm_region(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t *size, int flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object);
+          kern_return_t mach_vm_page_info(vm_map_t target, mach_vm_address_t address, int flavor, unsigned int *info, mach_msg_type_number_t *infoCnt);
+          #endif
+          EOF
+          cat > shim/IOSurface/IOSurface.h <<'EOF'
+          #ifndef IOSURFACE_SHIM_H
+          #define IOSURFACE_SHIM_H
+          #include <IOSurface/IOSurfaceBase.h>
+          #include <IOSurface/IOSurfaceRef.h>
+          #endif
+          EOF
+
+      - name: Build arm64e binary
+        run: |
+          clang -target arm64e-apple-ios15.0 \
+            -I"$GITHUB_WORKSPACE/shim" \
+            -isysroot "$GITHUB_WORKSPACE/sdks/iPhoneOS26.1.sdk" \
+            -fuse-ld=lld -fobjc-arc -O2 -Wall \
+            -Wno-deprecated-declarations -Wno-macro-redefined \
+            src/main.m src/util.c src/slide.c src/trigger.c src/wire.c \
+            src/exploit.c src/krw.c \
+            -framework IOSurface -framework Foundation \
+            -o clipwire
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipwire
+          path: clipwire
