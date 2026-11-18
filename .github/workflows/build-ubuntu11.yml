@@ -166,7 +166,7 @@ jobs:
           #define VM_REGION_SUBMAP_INFO_64 14
           #endif
 
-          static bool entry_looks_corrupt(U64 start, U64 expected_size, U64 *out_size)
+          bool entry_looks_corrupt(U64 start, U64 expected_size, U64 *out_size)
           {
               mach_vm_address_t a = start;
               mach_vm_size_t sz = 0;
